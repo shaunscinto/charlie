@@ -21,8 +21,9 @@
 #  + NEW: OTR low-profile / flush-mount filters (Description/col H)
 #  + NEW: VENT (range hoods) — Description-only routing (ignore groups) + subtypes + width + brand/color
 #  + UI UPDATE: Title/labels/placeholder + auto "Stock data last updated on: DD/MM" banner tied to Google Sheet
+#  + ADMIN UPGRADE: Set/Save Google Sheet URL in-app, CSV upload, robust local CSV fallback, fetch diagnostics
 
-import os, io, re, json
+import os, io, re, json, traceback
 from pathlib import Path
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -35,7 +36,8 @@ import streamlit as st
 
 # -------------------- Config --------------------
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
-DATA_CSV_URL     = os.getenv("DATA_CSV_URL", "").strip()
+# NOTE: DATA_CSV_URL can now be set via Admin UI and is persisted in META_FILE.
+ENV_DATA_CSV_URL = os.getenv("DATA_CSV_URL", "").strip()
 ADMIN_PIN        = os.getenv("ADMIN_PIN", "standardtv2025")
 BRAND_NAME       = os.getenv("BRAND_NAME", "Your Store")
 
@@ -46,6 +48,13 @@ PRICE_COL_INDEX  = os.getenv("PRICE_COL_INDEX", "").strip() or None # 1-based, e
 # Files for caching data + source metadata
 CACHE_FILE = "./_inventory_cache.parquet"
 META_FILE  = "./_source_meta.json"
+
+# Local CSV fallback candidates (auto-detected)
+LOCAL_CSV_CANDIDATES = [
+    "In-Stock Product Data - 10 stock.csv",
+    "inventory.csv",
+    "stock.csv"
+]
 
 # -------------------- Page --------------------
 st.set_page_config(page_title="Charlie - Your Personal Inventory Assistant (CLOSED BETA)", layout="wide")
@@ -109,10 +118,6 @@ def _write_meta(meta: dict):
         pass
 
 def _la_dt_from_http(last_modified_hdr: str | None, fallback_utc: datetime | None = None) -> datetime:
-    """
-    Convert Last-Modified header (HTTP-date) to America/Los_Angeles datetime.
-    If header missing/unparsable, use fallback_utc (assumed UTC) or now().
-    """
     try:
         if last_modified_hdr:
             dt = parsedate_to_datetime(last_modified_hdr)
@@ -148,58 +153,119 @@ def _fetch_sheet(url: str) -> pd.DataFrame:
     r.raise_for_status()
     return pd.read_csv(io.StringIO(r.text))
 
-def _load_or_refresh_inventory() -> tuple[pd.DataFrame, datetime | None]:
-    """
-    Returns (df, last_updated_la_dt). Will refresh cache if ETag/Last-Modified changed.
-    """
-    if not DATA_CSV_URL:
-        return pd.DataFrame(), None
+def _load_local_csv_fallback() -> pd.DataFrame | None:
+    # Try uploaded or bundled CSVs
+    for name in LOCAL_CSV_CANDIDATES:
+        p = find_file(name)
+        if p:
+            try:
+                return pd.read_csv(p)
+            except Exception:
+                continue
+    return None
 
+def _resolve_active_data_url() -> str:
+    # precedence: Admin-saved meta -> env var -> ""
     meta = _read_meta()
-    etag_new, lm_new = _head_sheet(DATA_CSV_URL)
+    saved = (meta.get("data_csv_url") or "").strip()
+    if saved:
+        return saved
+    return ENV_DATA_CSV_URL
 
-    etag_old = meta.get("etag")
-    lm_old   = meta.get("last_modified")
+def _save_active_data_url(url: str):
+    meta = _read_meta()
+    meta["data_csv_url"] = (url or "").strip()
+    _write_meta(meta)
 
-    need_refresh = False
-    if not os.path.exists(CACHE_FILE):
-        need_refresh = True
-    elif etag_new and etag_new != etag_old:
-        need_refresh = True
-    elif lm_new and lm_new != lm_old:
-        need_refresh = True
-    elif not (etag_old or lm_old):
-        # No known source meta yet; initialize
-        need_refresh = True
+def _load_or_refresh_inventory() -> tuple[pd.DataFrame, datetime | None, dict]:
+    """
+    Returns (df, last_updated_la_dt, diag). Will refresh cache if ETag/Last-Modified changed.
+    diag includes diagnostic info for Admin panel.
+    """
+    diag = {"source": None, "url": None, "error": None}
+    DATA_CSV_URL = _resolve_active_data_url()
 
-    last_updated_la = None
-
-    if need_refresh:
-        try:
-            raw = _fetch_sheet(DATA_CSV_URL)
-            df = normalize_columns(raw)
-            if len(df):
+    if not DATA_CSV_URL:
+        # Try local CSV immediately
+        local_df = _load_local_csv_fallback()
+        if local_df is not None and len(local_df):
+            diag["source"] = "local_csv"
+            diag["url"] = find_file(*LOCAL_CSV_CANDIDATES)
+            df = normalize_columns(local_df)
+            # Save parquet cache
+            try:
                 df.to_parquet(CACHE_FILE, index=False)
-            # Prefer Last-Modified for display; fall back to now (UTC)
-            now_utc = datetime.now(timezone.utc)
-            last_updated_la = _la_dt_from_http(lm_new, now_utc)
-            _write_meta({
-                "etag": etag_new,
-                "last_modified": lm_new,
-                "last_fetch_utc": now_utc.isoformat(),
-                "last_updated_display_la": last_updated_la.isoformat(),
+            except Exception:
+                pass
+            # Use file mtime as last-updated
+            last_la = None
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(diag["url"]), tz=ZoneInfo("America/Los_Angeles"))
+                last_la = mtime
+            except Exception:
+                pass
+            meta = _read_meta()
+            meta.update({
+                "etag": None,
+                "last_modified": None,
+                "last_fetch_utc": datetime.now(timezone.utc).isoformat(),
+                "last_updated_display_la": last_la.isoformat() if last_la else None,
             })
-            return df, last_updated_la
-        except Exception:
-            # On failure, try to fall back to local cache if present
-            pass
+            _write_meta(meta)
+            return df, last_la, diag
+        # If no local exists, fall through to old cache if present
+    else:
+        meta = _read_meta()
+        etag_new, lm_new = _head_sheet(DATA_CSV_URL)
+        etag_old = meta.get("etag")
+        lm_old   = meta.get("last_modified")
+
+        need_refresh = False
+        if not os.path.exists(CACHE_FILE):
+            need_refresh = True
+        elif etag_new and etag_new != etag_old:
+            need_refresh = True
+        elif lm_new and lm_new != lm_old:
+            need_refresh = True
+        elif not (etag_old or lm_old):
+            need_refresh = True
+
+        last_updated_la = None
+
+        if need_refresh:
+            try:
+                raw = _fetch_sheet(DATA_CSV_URL)
+                df = normalize_columns(raw)
+                if len(df):
+                    try:
+                        df.to_parquet(CACHE_FILE, index=False)
+                    except Exception:
+                        pass
+                # Prefer Last-Modified for display; fall back to now (UTC)
+                now_utc = datetime.now(timezone.utc)
+                last_updated_la = _la_dt_from_http(lm_new, now_utc)
+                _write_meta({
+                    "etag": etag_new,
+                    "last_modified": lm_new,
+                    "last_fetch_utc": now_utc.isoformat(),
+                    "last_updated_display_la": last_updated_la.isoformat(),
+                    "data_csv_url": DATA_CSV_URL
+                })
+                diag["source"] = "remote_csv"
+                diag["url"] = DATA_CSV_URL
+                return df, last_updated_la, diag
+            except Exception as e:
+                diag["error"] = f"Fetch failed: {e.__class__.__name__}: {e}"
 
     # Fallback: load cached parquet and compute display date from stored meta or file mtime
     try:
         df = pd.read_parquet(CACHE_FILE)
-    except Exception:
+        diag["source"] = diag["source"] or "cache_parquet"
+    except Exception as e:
+        diag["error"] = diag["error"] or f"Cache load failed: {e.__class__.__name__}: {e}"
         df = pd.DataFrame()
 
+    last_updated_la = None
     last_la_iso = _read_meta().get("last_updated_display_la")
     if last_la_iso:
         try:
@@ -208,14 +274,13 @@ def _load_or_refresh_inventory() -> tuple[pd.DataFrame, datetime | None]:
             last_updated_la = None
 
     if last_updated_la is None and os.path.exists(CACHE_FILE):
-        # Use file mtime (local tz) as a rough proxy
         try:
             mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_FILE), tz=ZoneInfo("America/Los_Angeles"))
             last_updated_la = mtime
         except Exception:
             last_updated_la = None
 
-    return df, last_updated_la
+    return df, last_updated_la, diag
 
 # -------------------- Mattress accessory/mattress code sets --------------------
 _PROVIDED_CODES = {
@@ -504,7 +569,6 @@ def _has_mw_word(q: str) -> bool:
     ql = q.lower()
     return any(w in ql for w in ["microwave","microwaves","micro","mw"])
 
-# Treat bare "otr" as OTR too (no microwave word required)
 def detect_microwave_otr(q: str) -> bool:
     ql = q.lower()
     return (
@@ -528,7 +592,6 @@ def detect_microwave_drawer(q: str) -> bool:
         re.search(r"\bmw\s*drawer\b", ql) is not None
     )
 
-# NEW: OTR refinement — detect "low profile" / "flush mount" intents
 def detect_mw_low_profile_intent(q: str) -> bool:
     ql = q.lower()
     return bool(
@@ -559,7 +622,7 @@ def detect_downdraft(q: str):
     is_induction = "induction" in ql
     is_electric  = ("electric" in ql) or ("radiant" in ql) or ("smoothtop" in ql) or ("smooth top" in ql)
     if mentions_hood or (has_dd and not (mentions_cooktop or mentions_range or mentions_oven)):
-        return True, "VENT", None  # VENT path now description-only, so no group list
+        return True, "VENT", None
     if mentions_range or mentions_oven:
         return True, "RANGE", ["RNGDDD", "RNGGDD", "RNGEDD"]
     if mentions_cooktop or has_dd:
@@ -927,33 +990,38 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 # -------------------- Load Data (with auto-update) --------------------
 def get_live_df_and_last_updated():
-    df, last_dt = _load_or_refresh_inventory()
-    if df.empty and DATA_CSV_URL:
-        # Fallback one-shot load if parquet missing/corrupted
+    df, last_dt, diag = _load_or_refresh_inventory()
+    if df.empty:
+        # As a last resort try a one-shot local read if meta URL was set but failed
         try:
-            df = normalize_columns(_fetch_sheet(DATA_CSV_URL))
-            if len(df):
-                df.to_parquet(CACHE_FILE, index=False)
-            now_la = datetime.now(ZoneInfo("America/Los_Angeles"))
-            meta = _read_meta()
-            meta.update({
-                "etag": meta.get("etag"),
-                "last_modified": meta.get("last_modified"),
-                "last_fetch_utc": datetime.now(timezone.utc).isoformat(),
-                "last_updated_display_la": now_la.isoformat(),
-            })
-            _write_meta(meta)
-            last_dt = now_la
+            fallback = _load_local_csv_fallback()
+            if fallback is not None and len(fallback):
+                df = normalize_columns(fallback)
+                if len(df):
+                    try: df.to_parquet(CACHE_FILE, index=False)
+                    except: pass
+                now_la = datetime.now(ZoneInfo("America/Los_Angeles"))
+                meta = _read_meta()
+                meta.update({
+                    "etag": meta.get("etag"),
+                    "last_modified": meta.get("last_modified"),
+                    "last_fetch_utc": datetime.now(timezone.utc).isoformat(),
+                    "last_updated_display_la": now_la.isoformat(),
+                })
+                _write_meta(meta)
+                last_dt = now_la
         except Exception:
             pass
-    return df, last_dt
+    return df, last_dt, diag
 
 # -------------------- Admin --------------------
 def admin_gate():
     with st.expander("Admin (upload/refresh)"):
         pin = st.text_input("Enter admin PIN", type="password")
-        c1, c2, _ = st.columns([1,1,1])
-        ok = c1.button("Unlock"); force = c2.button("Force reload (clear cache)")
+        c1, c2, c3 = st.columns([1,1,1])
+        ok   = c1.button("Unlock")
+        force= c2.button("Force reload (clear cache)")
+        show = c3.button("Show diagnostics")
         if force:
             try: st.cache_data.clear()
             except: pass
@@ -964,7 +1032,35 @@ def admin_gate():
             st.success("Cache cleared.")
         if ok:
             if pin == ADMIN_PIN:
-                st.success("Admin unlocked"); return True
+                st.success("Admin unlocked")
+                # Admin controls: set/save URL + upload CSV
+                st.markdown("### Data source")
+                current_url = _resolve_active_data_url()
+                new_url = st.text_input("Google Sheet CSV URL (published as CSV)", value=current_url, placeholder="https://docs.google.com/spreadsheets/d/.../pub?output=csv")
+                c4, c5, c6 = st.columns([1,1,1])
+                if c4.button("Save URL"):
+                    _save_active_data_url(new_url)
+                    st.success("Saved. Use 'Force reload' to pull fresh data.")
+                uploaded = st.file_uploader("Or upload a CSV to test immediately", type=["csv"])
+                if uploaded is not None:
+                    try:
+                        tmp = pd.read_csv(uploaded)
+                        tmp = normalize_columns(tmp)
+                        tmp.to_parquet(CACHE_FILE, index=False)
+                        now_la = datetime.now(ZoneInfo("America/Los_Angeles"))
+                        meta = _read_meta()
+                        meta.update({
+                            "etag": None, "last_modified": None,
+                            "last_fetch_utc": datetime.now(timezone.utc).isoformat(),
+                            "last_updated_display_la": now_la.isoformat(),
+                        })
+                        _write_meta(meta)
+                        st.success(f"Loaded {len(tmp):,} rows from uploaded CSV. Close/reopen to use.")
+                    except Exception as e:
+                        st.error(f"Upload failed: {e}")
+                if show:
+                    st.session_state.setdefault("_show_diag", True)
+                return True
             st.error("Invalid PIN")
     return False
 
@@ -972,15 +1068,26 @@ admin = admin_gate()
 st.divider()
 
 # -------------------- Load Data --------------------
-df, _last_updated_la = get_live_df_and_last_updated()
+df, _last_updated_la, _diag = get_live_df_and_last_updated()
 
 # Banner: top-left "Stock data last updated on: DD/MM"
 left, _ = st.columns([1,3])
 with left:
     st.markdown(f"**Stock data last updated on:** {_format_dd_mm(_last_updated_la)}")
 
+# Optional diagnostics (only after admin unlock + click)
+if admin and st.session_state.get("_show_diag"):
+    st.caption("Diagnostics")
+    d = {**({"source": None, "url": None, "error": None} if _diag is None else _diag)}
+    st.write({
+        "Source": d.get("source"),
+        "URL": d.get("url"),
+        "Error": d.get("error"),
+        "Rows": 0 if df is None or df.empty else int(len(df)),
+    })
+
 if df.empty:
-    st.warning("No data loaded yet. Use Admin above.")
+    st.warning("No data loaded yet. Use Admin above to set a Google Sheet CSV URL **or** upload a CSV.")
     st.stop()
 else:
     con = duckdb.connect(); con.register("inventory", df)
@@ -1169,7 +1276,6 @@ def vent_sub_keywords(q: str) -> list[str]:
         keys += ["UNDER CABINET", "UNDER-CABINET", "UNDERCABINET", "UNDCAB", "UNCAB"]
     if "wall mount" in ql or "wall hood" in ql or re.search(r"(?<!\w)wall(?!\w)", ql):
         keys += ["WALL MOUNT", "WALL HOOD", "WALL"]
-    # Dedup, preserve order-ish
     seen=set(); out=[]
     for k in keys:
         if k not in seen:
@@ -1187,7 +1293,6 @@ BASE_SYNONYMS = {
     "cooktop":"CTOP","cooktops":"CTOP",
     "washer":"WASH","washers":"WASH","laundry":"WASH",
     "dryer":"DRY","dryers":"DRY",
-    # CHANGED: route hood/vent terms to VENT (Category) explicitly
     "hood":"VENT","hoods":"VENT","range hood":"VENT","range hoods":"VENT",
     "vent":"VENT","vents":"VENT","ventilation":"VENT","extractor":"VENT","exhaust":"VENT",
     "mattress":"MATTS","mattresses":"MATTS","matts":"MATTS","matt":"MATTS",
@@ -1434,7 +1539,6 @@ def build_where(code_type: str, code: str, color: str = None, matte_only: bool =
                 built_in_width_active: bool = False,
                 matt_name_tokens: list[str] | None = None,
                 microwave_desc_patterns: list[str] | None = None,
-                # NEW: VENT description-only routing
                 vent_mode: bool = False,
                 vent_keywords: list[str] | None = None,
                 vent_width: int | None = None):
@@ -1486,7 +1590,6 @@ def build_where(code_type: str, code: str, color: str = None, matte_only: bool =
         parts.append("( \"Group\" IS NULL OR UPPER(TRIM(\"Group\")) NOT IN ('WSHACC','PEDS','STACK','DRYACC') )")
 
     if code_type == "Category" and not (rangetop_only or ctop_only) and not laundry_both_categories:
-        # --------- NEW: VENT description-only routing (ignore groups) ---------
         if vent_mode and code.upper() == "VENT":
             parts.append('UPPER(TRIM("Category")) = \'VENT\'')
             parts.append('( "Group" IS NULL OR UPPER("Group") NOT LIKE \'%ACC\' )')
@@ -1712,7 +1815,6 @@ def build_where(code_type: str, code: str, color: str = None, matte_only: bool =
     if built_in_width_active and (built_in_width is not None):
         parts.append(width_text_where_desc(built_in_width))
 
-    # NEW: add extra Description filters for OTR refinements
     if microwave_desc_patterns:
         desc_col = 'UPPER(COALESCE("Description", ""))'
         ors = " OR ".join([f"{desc_col} ILIKE '%{p.upper()}%'" for p in microwave_desc_patterns])
@@ -1760,7 +1862,7 @@ def compute_answer(q: str, code_type: str, code: str, color: str, brand_candidat
     if wall_only:
         code_type, code = "Category", "BICOOK"
 
-    # NEW: Microwave routing + OTR refinements (run before VENT)
+    # Microwave routing + OTR refinements (before VENT)
     groups_override = None
     microwave_desc_patterns = None
     if detect_microwave_otr(q):
@@ -1781,14 +1883,14 @@ def compute_answer(q: str, code_type: str, code: str, color: str, brand_candidat
         code_type, code = "Category", "OVENS"
         groups_override = ["MWDRWR"]
 
-    # -------- NEW: VENT intent (description-only, ignore groups) --------
+    # VENT description-only routing
     vent_mode = False
     vent_kw = None
     vent_width = None
     if detect_vent_intent(q):
         code_type, code = "Category", "VENT"
         vent_mode = True
-        vent_kw = vent_sub_keywords(q)  # may be empty/None
+        vent_kw = vent_sub_keywords(q)
         vent_width = detect_width_generic(q)
 
     tv_only = detect_tv(q)
@@ -1865,7 +1967,7 @@ def compute_answer(q: str, code_type: str, code: str, color: str, brand_candidat
     counter_depth = detect_counter_depth(q)
     full_or_standard_depth = detect_full_or_standard_depth(q)
 
-    # ---------- BUILT-IN refrigeration routing ----------
+    # BUILT-IN refrigeration routing
     bi_hit, bi_cat, bi_groups = detect_built_in_fridge(q)
     built_in_width = detect_width_generic(q)
     built_in_width_active = False
@@ -1919,11 +2021,9 @@ def compute_answer(q: str, code_type: str, code: str, color: str, brand_candidat
 
     dd_intent, dd_cat, dd_groups = detect_downdraft(q)
     if dd_intent and dd_cat:
-        # If the user meant a HOOD downdraft, we keep VENT description-only (no group filter).
         if dd_cat == "VENT":
             code_type, code = "Category", "VENT"
             vent_mode = True
-            # Ensure downdraft terms included even if user only said "downdraft"
             add_dd = ["DOWNDRAFT", "DOWN DRAFT", "DDRAFT", " POP UP", "POP-UP"]
             vent_kw = (vent_kw or []) + add_dd
         else:
@@ -1937,8 +2037,6 @@ def compute_answer(q: str, code_type: str, code: str, color: str, brand_candidat
     cfm_min, cfm_max, cfm_approx = parse_cfm_filter(q)
     require_cfm_in_desc = False
     if cfm_intent:
-        # For VENT searches we stay description-only (no groups). For general CFM without VENT words,
-        # we still bias to ventilation-y groups, but description must contain CFM.
         require_cfm_in_desc = True
         if not vent_mode and not (dd_intent and dd_cat == "VENT"):
             existing = set(EXISTING_GRP)

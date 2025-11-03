@@ -1,0 +1,19 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# App caches
+_inventory_cache.parquet
+_source_meta.json
+*.parquet
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
